@@ -1,6 +1,6 @@
 require('dotenv').config();
 const express = require('express');
-const sqlite3 = require('sqlite3').verbose();
+const { Pool } = require('pg');
 const bcrypt = require('bcryptjs');
 const cors = require('cors');
 const jwt = require('jsonwebtoken');
@@ -14,39 +14,111 @@ const SECRET_KEY = process.env.SECRET_KEY || 'clave_secreta_super_segura';
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY || null;
 const OPENAI_MODEL = process.env.OPENAI_MODEL || 'gpt-4o-mini';
 
+const DATABASE_URL = process.env.DATABASE_URL || process.env.PG_DATABASE_URL || null;
+const PG_MAX_CLIENTS = Number(process.env.PG_MAX_CLIENTS || 10);
+const USE_SSL = (process.env.PGSSLMODE === 'require' || process.env.PG_SSL === 'true');
+
+if (!DATABASE_URL) {
+  console.warn('WARNING: DATABASE_URL no definida. Asegúrate de configurar la conexión a Postgres.');
+}
+
+const pool = new Pool(Object.assign({
+  connectionString: DATABASE_URL,
+  max: PG_MAX_CLIENTS,
+  idleTimeoutMillis: 30000,
+  connectionTimeoutMillis: 2000
+}, USE_SSL ? { ssl: { rejectUnauthorized: false } } : {}));
+
 app.use(cors());
 app.use(express.json({ limit: '30mb' }));
 
 const apiLimiter = rateLimit({ windowMs: 60 * 1000, max: 20 });
 app.use('/api/', apiLimiter);
 
-const db = new sqlite3.Database('./db.sqlite', (err) => {
-  if (err) console.error('Error abriendo BD:', err);
-  else console.log('Base de datos SQLite lista.');
-});
+// ---------------------------------------------------
+// Schema init: intenta leer schema.sql, si falla crea tablas por JS
+// ---------------------------------------------------
+async function initSchema() {
+  try {
+    if (fs.existsSync('./schema.sql')) {
+      const sql = fs.readFileSync('./schema.sql', 'utf8');
+      await pool.query(sql);
+      console.log('Schema aplicado desde ./schema.sql');
+      return;
+    }
 
-// DB init (minimal comments)
-db.serialize(() => {
-  db.run(`CREATE TABLE IF NOT EXISTS users (id INTEGER PRIMARY KEY AUTOINCREMENT, username TEXT UNIQUE, email TEXT UNIQUE, password TEXT, created_at TEXT, last_login TEXT)`);
-  db.run(`CREATE TABLE IF NOT EXISTS training_plans (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER UNIQUE, plan_data TEXT, race_date TEXT, weeks TEXT, created_at TEXT DEFAULT (datetime('now')), FOREIGN KEY (user_id) REFERENCES users(id))`);
-  db.run(`CREATE TABLE IF NOT EXISTS plan_workouts (id INTEGER PRIMARY KEY AUTOINCREMENT, plan_id INTEGER NOT NULL, week INTEGER NOT NULL, day_name TEXT NOT NULL, date TEXT NOT NULL, sort_index INTEGER DEFAULT 0, type TEXT NOT NULL, distance_km REAL, pace_text TEXT, description TEXT, advice TEXT, created_at TEXT DEFAULT (datetime('now')), completed_at TEXT, FOREIGN KEY(plan_id) REFERENCES training_plans(id))`);
-  db.run(`CREATE INDEX IF NOT EXISTS idx_pw_planid_date ON plan_workouts(plan_id, date, sort_index)`);
-  db.run(`CREATE INDEX IF NOT EXISTS idx_pw_date ON plan_workouts(date)`);
-  db.run(`CREATE INDEX IF NOT EXISTS idx_pw_completed ON plan_workouts(completed_at)`);
+    // Fallback: crear tablas con DDL embebido
+    const ddl = `
+      CREATE TABLE IF NOT EXISTS users (
+        id SERIAL PRIMARY KEY,
+        username TEXT UNIQUE NOT NULL,
+        email TEXT UNIQUE NOT NULL,
+        password TEXT NOT NULL,
+        created_at TIMESTAMPTZ DEFAULT now(),
+        last_login TIMESTAMPTZ
+      );
 
-  db.get(`SELECT COUNT(*) AS count FROM users`, (err, row) => {
-    if (err) return console.error('Error comprobando usuarios:', err);
-    if (!row || row.count === 0) {
+      CREATE TABLE IF NOT EXISTS training_plans (
+        id SERIAL PRIMARY KEY,
+        user_id INTEGER UNIQUE REFERENCES users(id) ON DELETE CASCADE,
+        plan_data JSONB,
+        race_date DATE,
+        weeks INTEGER,
+        created_at TIMESTAMPTZ DEFAULT now()
+      );
+
+      CREATE TABLE IF NOT EXISTS plan_workouts (
+        id SERIAL PRIMARY KEY,
+        plan_id INTEGER NOT NULL REFERENCES training_plans(id) ON DELETE CASCADE,
+        week INTEGER NOT NULL,
+        day_name TEXT NOT NULL,
+        date DATE NOT NULL,
+        sort_index INTEGER DEFAULT 0,
+        type TEXT NOT NULL,
+        distance_km DOUBLE PRECISION,
+        pace_text TEXT,
+        description JSONB,
+        advice JSONB,
+        segments JSONB,
+        created_at TIMESTAMPTZ DEFAULT now(),
+        completed_at TIMESTAMPTZ
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_pw_planid_date ON plan_workouts(plan_id, date, sort_index);
+      CREATE INDEX IF NOT EXISTS idx_pw_date ON plan_workouts(date);
+      CREATE INDEX IF NOT EXISTS idx_pw_completed ON plan_workouts(completed_at);
+    `;
+    await pool.query(ddl);
+    console.log('Schema creado por fallback DDL');
+  } catch (err) {
+    console.error('Error inicializando schema:', err && err.stack ? err.stack : err);
+  }
+}
+
+// inicializar schema y usuario por defecto
+(async () => {
+  try {
+    await initSchema();
+
+    const r = await pool.query('SELECT COUNT(*) AS count FROM users');
+    const count = Number(r.rows[0].count || 0);
+    if (count === 0) {
       const createdAt = new Date().toISOString();
       const hashedPassword = bcrypt.hashSync('admin123', 10);
-      db.run(`INSERT INTO users (username, email, password, created_at, last_login) VALUES (?, ?, ?, ?, ?)`, ['admin', 'admin@example.com', hashedPassword, createdAt, createdAt], (err) => {
-        if (err) console.error('Error insertando usuario por defecto:', err); else console.log('Usuario por defecto creado');
-      });
+      await pool.query(
+        'INSERT INTO users (username, email, password, created_at, last_login) VALUES ($1,$2,$3,$4,$5)',
+        ['admin', 'admin@example.com', hashedPassword, createdAt, createdAt]
+      );
+      console.log('Usuario por defecto creado (admin)');
     }
-  });
-});
+  } catch (e) {
+    console.error('Error init DB/default user:', e && e.stack ? e.stack : e);
+  }
+})();
 
-// helpers
+// ---------------------------------------------------
+// Helpers (no cambian mucho respecto a tu versión original)
+// ---------------------------------------------------
 function sleep(ms) { return new Promise(resolve => setTimeout(resolve, ms)); }
 
 function safeStringify(v) {
@@ -109,8 +181,9 @@ function parseDateUTC(s){ const [y,m,d] = (s||'').split('-').map(Number); return
 function formatDateUTC(d){ return d.toISOString().slice(0,10); }
 function daysBetweenUTC(a,b){ const ms=24*60*60*1000; const ad=Date.UTC(a.getUTCFullYear(),a.getUTCMonth(),a.getUTCDate()); const bd=Date.UTC(b.getUTCFullYear(),b.getUTCMonth(),b.getUTCDate()); return Math.round((ad-bd)/ms); }
 
-function getPlanIdForUser(userId){
-  return new Promise((resolve,reject)=>{ db.get('SELECT id FROM training_plans WHERE user_id = ?', [userId], (err,row)=>{ if (err) return reject(err); if (!row) return resolve(null); resolve(row.id); }); });
+async function getPlanIdForUser(userId){
+  const res = await pool.query('SELECT id FROM training_plans WHERE user_id = $1 LIMIT 1', [userId]);
+  return res.rows[0] ? res.rows[0].id : null;
 }
 
 function assignDatesToPlan(plan, race_date_str, weeks, opts={ prunePast:true, shiftIfPast:false }){
@@ -159,6 +232,9 @@ function assignDatesToPlan(plan, race_date_str, weeks, opts={ prunePast:true, sh
   return plan;
 }
 
+// ---------------------------------------------------
+// OpenAI helper (sin cambios lógicos)
+// ---------------------------------------------------
 async function callOpenAI(payload = {}, opts = {}) {
   const { maxRetries = 4, initialBackoffSec = 1, maxBackoffSec = 30, model = OPENAI_MODEL } = opts;
   if (!OPENAI_API_KEY) { const e = new Error('OPENAI_API_KEY no definida en .env.'); e.meta = { code: 'NO_API_KEY' }; throw e; }
@@ -184,51 +260,115 @@ async function callOpenAI(payload = {}, opts = {}) {
     }
   }
 }
+// ---------------------------------------------------
+// insertDB: versión Postgres (async/await, transacción segura)
+// Garantiza que description/advice se insertan como JSONB válidos.
+// ---------------------------------------------------
+async function insertDB(userId, payload, planWithDates) {
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
 
-function insertDB(userId, payload, planWithDates) {
-  return new Promise((resolve, reject) => {
-    const planJsonStr = JSON.stringify(planWithDates);
-    db.run('BEGIN TRANSACTION', (beginErr) => {
-      if (beginErr) return reject(beginErr);
-      const insertPlanSql = `INSERT INTO training_plans (user_id, race_date, weeks, plan_data, created_at) VALUES (?, ?, ?, ?, ?)`;
-      const createdAt = new Date().toISOString();
-      db.run(insertPlanSql, [userId, payload.race_date, payload.weeks_until_race, planJsonStr, createdAt], function (planErr) {
-        if (planErr) { db.run('ROLLBACK', () => reject(planErr)); return; }
-        const planId = this.lastID;
-        const insertWorkoutSql = `INSERT INTO plan_workouts (plan_id, week, day_name, date, sort_index, type, distance_km, pace_text, description, advice, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`;
-        const stmt = db.prepare(insertWorkoutSql, (prepErr) => {
-          if (prepErr) { db.run('ROLLBACK', () => reject(prepErr)); return; }
-          const weeksArr = planWithDates.plan || [];
-          let total = 0, done = 0, errored = false;
-          weeksArr.forEach((weekObj) => { const weekNum = Number(weekObj.week) || 0; (weekObj.workouts || []).forEach((w, idx) => {
-            total++;
-            const workoutDate = w.date || null;
-            const dayName = w.day || null;
-            const type = w.type || null;
-            const distance = (typeof w.distance_km !== 'undefined' && w.distance_km !== null) ? Number(w.distance_km) : null;
-            const paceText = w.pace_min_km || w.pace_text || null;
-            const description = safeStringify(w.description);
-            const advice = safeStringify(w.advice);
-            const createdAtWorkout = new Date().toISOString();
-            stmt.run([planId, weekNum, dayName, workoutDate, idx, type, distance, paceText, description, advice, createdAtWorkout], (runErr) => {
-              if (runErr && !errored) { errored = true; stmt.finalize(() => { db.run('ROLLBACK', () => reject(runErr)); }); return; }
-              done++;
-              if (done === total && !errored) {
-                stmt.finalize((finalizeErr) => {
-                  if (finalizeErr) { db.run('ROLLBACK', () => reject(finalizeErr)); return; }
-                  db.run('COMMIT', (commitErr) => { if (commitErr) { db.run('ROLLBACK', () => reject(commitErr)); return; } resolve(planId); });
-                });
-              }
-            });
-          }); });
-          if (total === 0) { stmt.finalize(() => { db.run('COMMIT', (commitErr) => { if (commitErr) { db.run('ROLLBACK', () => reject(commitErr)); return; } resolve(planId); }); }); }
-        });
-      });
-    });
-  });
+    // Guardar plan como JSONB: si planWithDates es objeto JS, pg lo convertirá correctamente
+    const planJson = planWithDates;
+    const createdAt = new Date().toISOString();
+
+    const insertPlanSql = `
+      INSERT INTO training_plans (user_id, race_date, weeks, plan_data, created_at)
+      VALUES ($1, $2, $3, $4, $5)
+      RETURNING id
+    `;
+
+    const planRes = await client.query(insertPlanSql, [userId, payload.race_date, payload.weeks_until_race, planJson, createdAt]);
+    const planId = planRes.rows[0].id;
+
+    // NOTA: casteamos explícitamente los parámetros 9 y 10 a jsonb ($9::jsonb, $10::jsonb)
+    const insertWorkoutSql = `
+      INSERT INTO plan_workouts
+        (plan_id, week, day_name, date, sort_index, type, distance_km, pace_text, description, advice, created_at)
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9::jsonb,$10::jsonb,$11)
+    `;
+
+    const weeksArr = planWithDates.plan || [];
+    for (const weekObj of weeksArr) {
+      const weekNum = Number(weekObj.week) || 0;
+      const wks = weekObj.workouts || [];
+      for (let idx = 0; idx < wks.length; idx++) {
+        const w = wks[idx];
+        const workoutDate = w.date || null;
+        const dayName = w.day || null;
+        const type = w.type || null;
+        const distance = (typeof w.distance_km !== 'undefined' && w.distance_km !== null) ? Number(w.distance_km) : null;
+        const paceText = w.pace_min_km || w.pace_text || null;
+
+        // Normalizar description/advice para jsonb: aseguramos un objeto/array válido y
+        // luego lo stringifyamos para pasarlo como parámetro que se castea a jsonb en la query.
+        let descriptionVal = null;
+        if (w.description == null) {
+          descriptionVal = null;
+        } else if (typeof w.description === 'object') {
+          descriptionVal = w.description; // array u objeto
+        } else {
+          // string: intentar parse
+          try {
+            descriptionVal = JSON.parse(w.description);
+          } catch (e) {
+            // no es JSON válido -> lo guardamos como array de líneas si contiene saltos,
+            // o como { text: '...' }
+            if (typeof w.description === 'string' && w.description.includes('\n')) {
+              descriptionVal = w.description.split(/\r?\n/).filter(Boolean);
+            } else {
+              descriptionVal = { text: String(w.description) };
+            }
+          }
+        }
+
+        let adviceVal = null;
+        if (w.advice == null) {
+          adviceVal = null;
+        } else if (typeof w.advice === 'object') {
+          adviceVal = w.advice;
+        } else {
+          try {
+            adviceVal = JSON.parse(w.advice);
+          } catch (e) {
+            if (typeof w.advice === 'string' && w.advice.includes('\n')) {
+              adviceVal = w.advice.split(/\r?\n/).filter(Boolean);
+            } else {
+              adviceVal = { text: String(w.advice) };
+            }
+          }
+        }
+
+        const createdAtWorkout = new Date().toISOString();
+
+        // stringify para garantizar envío correcto y evitar problemas con comillas/crlf
+        const descParam = descriptionVal == null ? null : JSON.stringify(descriptionVal);
+        const adviceParam = adviceVal == null ? null : JSON.stringify(adviceVal);
+
+        await client.query(insertWorkoutSql, [
+          planId, weekNum, dayName, workoutDate, idx, type, distance, paceText,
+          descParam,
+          adviceParam,
+          createdAtWorkout
+        ]);
+      }
+    }
+
+    await client.query('COMMIT');
+    return planId;
+  } catch (err) {
+    await client.query('ROLLBACK');
+    console.error('[insertDB] DB error:', err && err.stack ? err.stack : err);
+    throw err;
+  } finally {
+    client.release();
+  }
 }
-
-// summarize block for progression
+ 
+// ---------------------------------------------------
+// summarizeBlock, buildBlockPrompt, validateBlock (sin cambios funcionales)
+// ---------------------------------------------------
 function summarizeBlock(blockJson) {
   const weeks = (blockJson && Array.isArray(blockJson.plan)) ? blockJson.plan : [];
   if (!weeks.length) return null;
@@ -301,7 +441,10 @@ function validateBlock(blockJson, payload, previousSummary) {
   }
   return errors;
 }
-// main endpoint (blocks + progression)
+
+// ---------------------------------------------------
+// Main endpoint: /api/generate-plan (mantener lógica original, usando pool)
+// ---------------------------------------------------
 app.post('/api/generate-plan', async (req, res) => {
   const payload = req.body;
   if (!payload.level || !payload.race_type || !payload.days_per_week || !payload.race_date) {
@@ -462,40 +605,44 @@ app.post('/api/generate-plan', async (req, res) => {
   }
 });
 
-// auth + other endpoints (kept concise)
-app.post('/register', (req, res) => {
-  const { username, password, confirmPassword, email } = req.body;
-  const date = new Date().toISOString();
+// ---------------------------------------------------
+// auth + other endpoints (adaptados a pg)
+// ---------------------------------------------------
+app.post('/register', async (req, res) => {
+  try {
+    const { username, password, confirmPassword, email } = req.body;
+    const date = new Date().toISOString();
 
-  if (!username || !password || !email || !confirmPassword) {
-    return res.status(400).json({ error: 'Todos los campos son requeridos' });
-  }
-  if (password !== confirmPassword) {
-    return res.status(400).json({ error: 'Las contraseñas no coinciden' });
-  }
-  if (!/^(?=.*[a-z])(?=.*[A-Z])(?=.*\d).{8,}$/.test(password)) {
-    return res.status(400).json({ error: 'La contraseña debe tener al menos 8 caracteres, una mayúscula, una minúscula y un número.' });
-  }
-
-  const hashedPassword = bcrypt.hashSync(password, 10);
-  const stmt = db.prepare('INSERT INTO users (username, email, password, created_at) VALUES (?, ?, ?, ?)');
-  stmt.run([username, email, hashedPassword, date], function (err) {
-    if (err) {
-      if (err.message.includes('UNIQUE')) return res.status(400).json({ error: 'Usuario o email ya existe' });
-      return res.status(500).json({ error: 'Error registrando usuario' });
+    if (!username || !password || !email || !confirmPassword) {
+      return res.status(400).json({ error: 'Todos los campos son requeridos' });
     }
-    res.json({ message: 'Registro exitoso', userId: this.lastID });
-  });
-  stmt.finalize();
-});
-app.post('/login', (req, res) => {
-  const { username, password } = req.body;
-  if (!username || !password) {
-    return res.status(400).json({ error: 'Usuario y contraseña requeridos' });
-  }
+    if (password !== confirmPassword) {
+      return res.status(400).json({ error: 'Las contraseñas no coinciden' });
+    }
+    if (!/^(?=.*[a-z])(?=.*[A-Z])(?=.*\d).{8,}$/.test(password)) {
+      return res.status(400).json({ error: 'La contraseña debe tener al menos 8 caracteres, una mayúscula, una minúscula y un número.' });
+    }
 
-  db.get('SELECT * FROM users WHERE username = ?', [username], (err, user) => {
-    if (err) return res.status(500).json({ error: 'Error en la base de datos' });
+    const hashedPassword = bcrypt.hashSync(password, 10);
+    const insertSql = `INSERT INTO users (username, email, password, created_at) VALUES ($1, $2, $3, $4) RETURNING id`;
+    const result = await pool.query(insertSql, [username, email, hashedPassword, date]);
+    res.json({ message: 'Registro exitoso', userId: result.rows[0].id });
+  } catch (err) {
+    if (err && err.code === '23505') return res.status(400).json({ error: 'Usuario o email ya existe' });
+    console.error('register error', err && err.stack ? err.stack : err);
+    res.status(500).json({ error: 'Error registrando usuario' });
+  }
+});
+
+app.post('/login', async (req, res) => {
+  try {
+    const { username, password } = req.body;
+    if (!username || !password) {
+      return res.status(400).json({ error: 'Usuario y contraseña requeridos' });
+    }
+
+    const r = await pool.query('SELECT * FROM users WHERE username = $1 LIMIT 1', [username]);
+    const user = r.rows[0];
     if (!user) return res.status(401).json({ error: 'Usuario no encontrado' });
 
     const validPass = bcrypt.compareSync(password, user.password);
@@ -504,13 +651,15 @@ app.post('/login', (req, res) => {
     const token = jwt.sign({ id: user.id, username: user.username }, SECRET_KEY, { expiresIn: '1h' });
     const lastLogin = new Date().toISOString();
 
-    db.run('UPDATE users SET last_login = ? WHERE id = ?', [lastLogin, user.id], (uErr) => {
-      if (uErr) console.warn('Error actualizando last_login', uErr);
-    });
+    try { await pool.query('UPDATE users SET last_login = $1 WHERE id = $2', [lastLogin, user.id]); } catch (uErr) { console.warn('Error actualizando last_login', uErr); }
 
     res.json({ message: 'Login correcto', token, username: user.username, userId: user.id });
-  });
+  } catch (err) {
+    console.error('login error', err && err.stack ? err.stack : err);
+    res.status(500).json({ error: 'Error en el login' });
+  }
 });
+
 app.get('/api/workouts', async (req, res) => {
   try {
     if (!req.headers['authorization']) return res.status(401).json({ error: 'No autorizado' });
@@ -523,31 +672,20 @@ app.get('/api/workouts', async (req, res) => {
 
     console.log('[api/workouts] fetching workouts for planId=', planId);
 
-    db.all('SELECT * FROM plan_workouts WHERE plan_id = ? ORDER BY date ASC', [planId], (err, rows) => {
-      if (err) {
-        console.error('[api/workouts] db.all ERROR:', err);
-        return res.status(500).json({ error: 'Error en la base de datos', details: err.message });
-      }
+    const r = await pool.query('SELECT * FROM plan_workouts WHERE plan_id = $1 ORDER BY date ASC', [planId]);
+    const rows = r.rows || [];
 
-      console.log('[api/workouts] rows returned:', (rows || []).length);
-
-      const tryParse = (s) => {
-        if (s == null) return s;
-        if (typeof s !== 'string') return s;
-        try { return JSON.parse(s); } catch (e) { return s; }
+    const parsed = (rows || []).map(rw => {
+      return {
+        ...rw,
+        // si description/advice vienen como JSONB ya serán objetos; si son strings, intentamos parsear
+        description: (typeof rw.description === 'string') ? ( (() => { try { return JSON.parse(rw.description); } catch(e){ return rw.description; } })() ) : rw.description,
+        advice: (typeof rw.advice === 'string') ? ( (() => { try { return JSON.parse(rw.advice); } catch(e){ return rw.advice; } })() ) : rw.advice,
+        segments: rw.segments
       };
-
-      const parsed = (rows || []).map(r => {
-        return {
-          ...r,
-          description: tryParse(r.description),
-          advice: tryParse(r.advice),
-          segments: tryParse(r.segments)
-        };
-      });
-
-      return res.json({ workouts: parsed });
     });
+
+    return res.json({ workouts: parsed });
   } catch (err) {
     console.error('[api/workouts] auth/error:', err && err.stack ? err.stack : err);
     return res.status(401).json({ error: 'No autorizado' });
@@ -565,16 +703,12 @@ app.get('/api/next-workout', async (req, res) => {
     const planId = await getPlanIdForUser(userId);
     if (!planId) return res.status(404).json({ error: 'No se encontró plan para el usuario' });
 
-    db.get(
-      'SELECT * FROM plan_workouts WHERE plan_id = ? AND date >= ? ORDER BY date ASC LIMIT 1',
-      [planId, today],
-      (err, next_workout) => {
-        if (err) return res.status(500).json({ error: 'Error en la base de datos' });
-        if (!next_workout) return res.status(404).json({ error: 'No se encontró próximo entrenamiento' });
-        return res.json(next_workout);
-      }
-    );
+    const r = await pool.query('SELECT * FROM plan_workouts WHERE plan_id = $1 AND date >= $2 ORDER BY date ASC LIMIT 1', [planId, today]);
+    const next_workout = r.rows[0];
+    if (!next_workout) return res.status(404).json({ error: 'No se encontró próximo entrenamiento' });
+    return res.json(next_workout);
   } catch (err) {
+    console.error('next-workout error', err && err.stack ? err.stack : err);
     return res.status(401).json({ error: 'No autorizado' });
   }
 });
