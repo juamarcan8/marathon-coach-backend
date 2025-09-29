@@ -389,67 +389,82 @@ function summarizeBlock(blockJson) {
     avg_weekly_km_last_block: avgWeeklyKm
   };
 }
-
 function buildBlockPrompt(payload, blockStart, blockLength, blockEnd, fixedDaysArray = null, includeRace = false, previousSummary = null) {
-    const {
-      race_type, level, days_per_week, race_date, weeks_until_race,
-      preferred_longrun_day, target_time_minutes, recent_5k_minutes
-    } = payload;
+  const {
+    race_type,
+    level,
+    days_per_week,
+    race_date,
+    weeks_until_race,
+    preferred_longrun_day,
+    target_time_minutes,
+    recent_5k_minutes
+  } = payload;
 
-    const fixedDaysMsg = fixedDaysArray && fixedDaysArray.length
-      ? `Mantén estos días fijos: ${fixedDaysArray.join(', ')}.`
-      : `Elige ${days_per_week} días fijos por semana y mantenlos iguales en todo el bloque.`;
+  const fixedDaysMsg = fixedDaysArray && fixedDaysArray.length
+    ? `Mantén los mismos días fijos: ${fixedDaysArray.join(', ')}.`
+    : `Elige ${days_per_week} días fijos y mantenlos iguales en todas las semanas del bloque.`;
 
-    const raceMsg = includeRace
-      ? `ATENCIÓN: este bloque INCLUYE la semana final. La semana final debe contener la CARRERA como ÚLTIMO entrenamiento (fecha: ${race_date}) y en su descripción añade una estrategia de carrera basada en el ritmo objetivo.`
-      : `Este bloque NO debe incluir la carrera ni mencionar su fecha.`;
+  const raceMsg = includeRace
+    ? `ATENCIÓN: este bloque INCLUYE la semana final. La CARRERA debe ser el ÚLTIMO entrenamiento de la semana y usar la fecha ${race_date}.`
+    : `Este bloque NO incluye la carrera. No la pongas aquí.`;
 
-    const prevMsg = previousSummary
-      ? `Contexto previo: semana ${previousSummary.lastWeekIndex}, km última semana ${previousSummary.lastWeek_total_km} km, long run ${previousSummary.lastWeek_longrun_km} km. Usa esto para progresión coherente.`
-      : '';
+  const progressionShort = [
+    'PROGRESIÓN (OBLIGATORIA):',
+    '- Volumen semanal no debe subir >10% respecto última semana conocida.',
+    '- Long Run no aumentar >3 km/sem (ideal 1–2 km).',
+    '- Cada 3ª o 4ª semana: recuperación (-15–25% volumen).',
+    '- Últimas 2–3 semanas: taper (reducción progresiva).',
+    '- Ajusta ritmos según 5k/objetivo.'
+  ].join(' ');
 
-    const progressionShort = [
-      'Reglas de progresión (OBLIGATORIAS):',
-      '1) Km semanales: no subir >10% vs última semana conocida.',
-      '2) Long run: +1–2 km/sem o max +3 km; no >120% de la distancia objetivo; si race_type es 21k/42k, nunca superar la distancia de la carrera.',
-      '3) Semana de recuperación cada 3ª–4ª (–15–25% volumen).',
-      '4) Últimas 2–3 semanas: taper (reducción progresiva).',
-      '5) Ajusta ritmos según 5k/objetivo; prioriza seguridad y consistencia.'
-    ].join(' ');
+  const longRunLimits = [
+    'LONG RUN: nunca >120% de la distancia objetivo.',
+    'Si objetivo es 21k o 42k, Long Run nunca debe EXCEDER la distancia objetivo.'
+  ].join(' ');
 
-    const workoutsVariety = 'Variedad segura: alterna rodajes suaves, CA-CO (si el nivel lo permite), intervalos/series, tempo, fartlek, progresivos y long runs.';
+  const beginnerRule = [
+    'RESTRICCIÓN INICIAL: Si nivel indica "principiante" o "beginner", comienza de forma muy conservadora:',
+    '- Long Run inicial: corto y cómodo (no más del 20–40% de la distancia objetivo, o 6–8 km máximo si la carrera es corta).',
+    '- No programar picos altos en las primeras 2–4 semanas; incrementar progresivamente según regla de +10%/semana y límites de Long Run.',
+    `- Ten en cuenta ${weeks_until_race} semanas hasta la carrera: si quedan pocas semanas, prioriza seguridad y adaptaciones (menos volumen, más calidad y taper).`
+  ].join(' ');
 
-    const firstLongRunGuideline = [
-      'Primera long run (orientativa según objetivo y nivel):',
-      '10K -> principiante 3–4 km, intermedio 5–6 km, avanzado 7–8 km.',
-      '21K/42K -> empieza 20–30% de la distancia objetivo según nivel.'
-    ].join(' ');
+  const typesMsg = 'TIPOS: usa variedad segura: rodajes fáciles, long run, tempo, intervalos/series, fartlek, CA-CO si procede, y semanas de recuperación.';
 
-    const outputSpec = 'Salida: SOLO JSON. Formato: { "plan":[{ "week":n,"workouts":[...] }, ...], "summary":"", "descripcion":"", "consejos_generales":"" }.' +
-                      ' Cada workout: day (es), weekday_index (1=Lunes..7=Domingo), type, distance_km (num), pace_min_km (mm:ss), intensity, description (3–6 frases numeradas), advice. Si hay series/fartlek -> segments array.';
+  const raceDayStrategy = 'DÍA DE CARRERA: en la descripción de la sesión (solo en la semana final) añade una estrategia coherente con el ritmo objetivo: salida ligeramente más lenta, mantener ritmo objetivo en la parte central y acabar fuerte; incluye hidratación y mentalidad.';
 
-    const raceDayRule = includeRace
-      ? 'DÍA DE CARRERA: la descripción debe incluir estrategia de pacing acorde al ritmo objetivo (empezar ligeramente más lento, estabilizar en ritmo objetivo, acelerar últimos km) y consejos de hidratación/mental.'
-      : '';
+  const prevMsg = previousSummary
+    ? `Contexto previo: última semana idx ${previousSummary.lastWeekIndex}, km ${previousSummary.lastWeek_total_km} (long ${previousSummary.lastWeek_longrun_km}). Usa esto para coherencia.`
+    : '';
 
-    const compact = [
-      'Eres un entrenador experto en running. RESPONDE SOLO con JSON válido y NADA más.',
-      `Bloque de ${blockLength} semanas: ${blockStart}-${blockEnd} de ${weeks_until_race}.`,
-      `Tipo:${race_type} Nivel:${level} Días/sem:${days_per_week} Día long run:${preferred_longrun_day || 'no especificado'}.`,
-      `5k:${recent_5k_minutes ?? 'no especificado'} Objetivo(min):${target_time_minutes ?? 'no especificado'}.`,
-      fixedDaysMsg,
-      raceMsg,
-      prevMsg,
-      progressionShort,
-      firstLongRunGuideline,
-      workoutsVariety,
-      raceDayRule,
-      outputSpec,
-      'NO añadas texto fuera del JSON.'
-    ].filter(Boolean).join('\n');
+  const header = [
+    'Eres un entrenador experto en running. Responde SOLO con JSON válido (solo el objeto JSON).',
+    `Genera bloque ${blockLength} semanas: semanas ${blockStart}-${blockEnd} de ${weeks_until_race}.`,
+    `Tipo:${race_type}|Nivel:${level}|Días/sem:${days_per_week}|LongRun día:${preferred_longrun_day || 'no especificado'}`,
+    `Mejor5k:${recent_5k_minutes ?? 'no especificado'}|Objetivo(min):${target_time_minutes ?? 'no especificado'}`
+  ].join(' ');
 
-    return compact;
+  const outputSpec = 'Salida: JSON { "plan":[{ "week":n,"workouts":[...] },... ], "summary":"", "descripcion":"", "consejos_generales":"" }.' +
+    ' Cada workout: day (es), weekday_index(1=Lunes..7=Dom), type, distance_km (n), pace_min_km (mm:ss), intensity, description (3–6 frases numeradas), advice. Si hay series incluye segments.';
+
+  const noExtra = 'NO añadas texto fuera del JSON.';
+
+  return [
+    header,
+    fixedDaysMsg,
+    raceMsg,
+    prevMsg,
+    progressionShort,
+    longRunLimits,
+    beginnerRule,
+    typesMsg,
+    raceDayStrategy,
+    outputSpec,
+    noExtra
+  ].filter(Boolean).join('\n');
 }
+
 
 
 function validateBlock(blockJson, payload, previousSummary) {
