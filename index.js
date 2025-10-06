@@ -369,103 +369,159 @@ async function insertDB(userId, payload, planWithDates) {
 // ---------------------------------------------------
 // summarizeBlock, buildBlockPrompt, validateBlock (sin cambios funcionales)
 // ---------------------------------------------------
-function summarizeBlock(blockJson) {
+// retorna objeto detallado y compacto (para enviar al prompt)
+function summarizeBlock(blockJson, weeksLeft = null) {
   const weeks = (blockJson && Array.isArray(blockJson.plan)) ? blockJson.plan : [];
   if (!weeks.length) return null;
+
+  // última semana del bloque
   const lastWeek = weeks[weeks.length - 1];
-  const weekIndex = Number(lastWeek.week) || null;
-  let totalKm = 0;
-  let longrunKm = 0;
+  const lastWeekIndex = Number(lastWeek.week) || null;
+
+  let totalKmLastWeek = 0;
+  let longKmLastWeek = 0;
+  let maxWorkoutKm = 0;
   let hardestType = null;
-  let maxIntensityScore = -Infinity;
-  const intensityScore = (s) => ({ easy:0, recovery:0, long:0.5, tempo:1, interval:2 }[s] ?? 0);
-  weeks.forEach(wk => { (wk.workouts || []).forEach(w => { if (typeof w.distance_km === 'number') totalKm += Number(w.distance_km); const intScore = intensityScore(w.intensity); if (intScore > maxIntensityScore) { maxIntensityScore = intScore; hardestType = w.type || w.intensity; } if ((w.type || '').toLowerCase().includes('long')) { longrunKm = Math.max(longrunKm, Number(w.distance_km) || 0); } }); });
-  const avgWeeklyKm = Math.round((totalKm / weeks.length) * 10) / 10;
-  return {
-    lastWeekIndex: weekIndex,
-    lastWeek_total_km: Math.round(totalKm * 10) / 10,
-    lastWeek_longrun_km: Math.round(longrunKm * 10) / 10,
-    lastWeek_hardest_type: hardestType,
-    avg_weekly_km_last_block: avgWeeklyKm
+  // intensidad: easy=0, recovery=0, long=0.5, tempo=1, interval=2
+  const scoreFor = (s) => ({ easy:0, recovery:0, long:0.5, tempo:1, interval:2, fartlek:1.2, 'ca-co':0.4 }[ (s||'').toLowerCase() ] ?? 0);
+  let maxIntensity = -Infinity;
+  let totalKmBlock = 0;
+  let weeksCount = weeks.length;
+
+  weeks.forEach(wk => {
+    const wkWorkouts = wk.workouts || [];
+    let wkKm = 0;
+    wkWorkouts.forEach(w => {
+      const dk = (typeof w.distance_km === 'number') ? Number(w.distance_km) : 0;
+      wkKm += dk;
+      totalKmBlock += dk;
+      maxWorkoutKm = Math.max(maxWorkoutKm, dk);
+      // detect long run
+      if ((w.type || '').toLowerCase().includes('long')) {
+        longKmLastWeek = Math.max(longKmLastWeek, dk);
+      }
+      const iscore = scoreFor(w.intensity || w.type);
+      if (iscore > maxIntensity) {
+        maxIntensity = iscore;
+        hardestType = w.type || w.intensity || null;
+      }
+    });
+    if (wk === lastWeek) {
+      totalKmLastWeek = wkKm;
+    }
+  });
+
+  const avgWeeklyKm = weeksCount ? Math.round((totalKmBlock / weeksCount) * 10) / 10 : 0;
+  const intensityScore = Math.round((maxIntensity === -Infinity ? 0 : maxIntensity) * 10) / 10;
+
+  // detect recovery (si la última semana tiene -15% o más de reducción respecto al promedio previo del bloque)
+  const recoveryLast = (() => {
+    // si last week < avg * 0.87 consideramos recovery
+    if (!avgWeeklyKm) return false;
+    return totalKmLastWeek <= avgWeeklyKm * 0.87;
+  })();
+
+  // trend_pct vs avg (puedes mejorar si ofreces prevSummary original)
+  const trendPct = avgWeeklyKm ? Math.round(((totalKmLastWeek - avgWeeklyKm) / (avgWeeklyKm || 1)) * 10) / 10 : 0;
+
+  const summary = {
+    lastWeekIndex: lastWeekIndex,
+    weeksInBlock: weeksCount,
+    total_km_last_week: Math.round(totalKmLastWeek * 10) / 10,
+    long_km_last_week: Math.round(longKmLastWeek * 10) / 10,
+    avg_weekly_km_block: avgWeeklyKm,
+    max_workout_km: Math.round(maxWorkoutKm * 10) / 10,
+    intensity_score: intensityScore,
+    recovery_last: Boolean(recoveryLast),
+    trend_pct: trendPct,
+    hardest_type: hardestType || ''
   };
+
+  return summary;
 }
-function buildBlockPrompt(payload, blockStart, blockLength, blockEnd, fixedDaysArray = null, includeRace = false, previousSummary = null) {
-  const {
-    race_type,
-    level,
-    days_per_week,
-    race_date,
-    weeks_until_race,
-    preferred_longrun_day,
-    target_time_minutes,
-    recent_5k_minutes
-  } = payload;
 
+function compactSummaryForPrompt(summaryObj, weeksLeft) {
+  if (!summaryObj) return '';
+  const s = summaryObj;
+  const left = (typeof weeksLeft === 'number') ? weeksLeft : (s.weeksInBlock ? Math.max(0, (s.lastWeekIndex ? (/* no: requires global weeks */0) : 0)) : 0);
+  // formato compacto: key=value;key2=value2...
+  const parts = [
+    `week=${s.lastWeekIndex || 0}`,
+    `left=${left}`,
+    `tk=${s.total_km_last_week || 0}`,
+    `lk=${s.long_km_last_week || 0}`,
+    `avg=${s.avg_weekly_km_block || 0}`,
+    `max=${s.max_workout_km || 0}`,
+    `int=${s.intensity_score || 0}`,
+    `rec=${s.recovery_last ? 1 : 0}`,
+    `trend=${s.trend_pct || 0}`,
+    `hard=${(s.hardest_type || '').toLowerCase().replace(/\s+/g,'_')}`
+  ];
+  return `PREV: ${parts.join(';')}`;
+}
+
+
+function buildBlockPrompt(payload, blockStart, blockLength, blockEnd, fixedDaysArray = null, includeRace = false, previousSummary = null, isFirstBlock) {
+  const { race_type, level, days_per_week, race_date, weeks_until_race, preferred_longrun_day, target_time_minutes, recent_5k_minutes } = payload;
+
+  const opts = { blockStart, blockLength, blockEnd, fixedDaysArray, includeRace, previousSummary };
+
+  const raceRaw = (payload.race_type).toString().toLowerCase();
+  const levelRaw = (payload.level).toString().toLowerCase();
+
+  console.log(raceRaw + levelRaw);
+
+  let specificPrompt = '';
+
+  console.log(isFirstBlock)
+  switch (`${raceRaw}:${levelRaw}`) {
+
+    case '5k:principiante': specificPrompt = buildPrompt_5k_principiante(payload, opts, isFirstBlock);
+      break;
+    case '5k:intermedio':  specificPrompt = buildPrompt_5k_intermedio(payload, opts ,isFirstBlock);
+      break;
+    case '5k:avanzado':    specificPrompt = buildPrompt_5k_avanzado(payload, opts,isFirstBlock);
+      break;
+    case '10k:principiante': specificPrompt = buildPrompt_10k_principiante(payload, opts,isFirstBlock);
+      break;
+    case '10k:intermedio':  specificPrompt = buildPrompt_10k_intermedio(payload, opts,isFirstBlock);
+      break;
+    case '10k:avanzado':    specificPrompt = buildPrompt_10k_avanzado(payload, opts,isFirstBlock);
+      break;
+    case '21k:principiante': specificPrompt = buildPrompt_21k_principiante(payload, opts,isFirstBlock);
+      break;
+    case '21k:intermedio':  specificPrompt = buildPrompt_21k_intermedio(payload, opts,isFirstBlock);
+      break;
+    case '21k:avanzado':    specificPrompt = buildPrompt_21k_avanzado(payload, opts,isFirstBlock);
+      break;
+    case '42k:principiante': specificPrompt = buildPrompt_42k_principiante(payload, opts,isFirstBlock);
+      break;
+    case '42k:intermedio':  specificPrompt = buildPrompt_42k_intermedio(payload, opts,isFirstBlock);
+      break;
+    case '42k:avanzado':    specificPrompt = buildPrompt_42k_avanzado(payload, opts,isFirstBlock);
+      break;
+  }
   const fixedDaysMsg = fixedDaysArray && fixedDaysArray.length
-    ? `Mantén los mismos días fijos: ${fixedDaysArray.join(', ')}.`
-    : `Elige ${days_per_week} días fijos y mantenlos iguales en todas las semanas del bloque.`;
-
+    ? `Mantén los mismos días de entrenamiento: ${fixedDaysArray.join(', ')}.`
+    : `Elige ${days_per_week} días fijos de la semana y mantenlos idénticos en TODAS las semanas del bloque.`;
   const raceMsg = includeRace
-    ? `ATENCIÓN: este bloque INCLUYE la semana final. La CARRERA debe ser el ÚLTIMO entrenamiento de la semana y usar la fecha ${race_date}.`
-    : `Este bloque NO incluye la carrera. No la pongas aquí.`;
-
-  const progressionShort = [
-    'PROGRESIÓN (OBLIGATORIA):',
-    '- Volumen semanal no debe subir >10% respecto última semana conocida.',
-    '- Long Run no aumentar >3 km/sem (ideal 1–2 km).',
-    '- Cada 3ª o 4ª semana: recuperación (-15–25% volumen).',
-    '- Últimas 2–3 semanas: taper (reducción progresiva).',
-    '- Ajusta ritmos según 5k/objetivo.'
-  ].join(' ');
-
-  const longRunLimits = [
-    'LONG RUN: nunca >120% de la distancia objetivo.',
-    'Si objetivo es 21k o 42k, Long Run nunca debe EXCEDER la distancia objetivo.'
-  ].join(' ');
-
-  const beginnerRule = [
-    'RESTRICCIÓN INICIAL: Si nivel indica "principiante" o "beginner", comienza de forma muy conservadora:',
-    '- Long Run inicial: corto y cómodo (no más del 20–40% de la distancia objetivo, o 6–8 km máximo si la carrera es corta).',
-    '- No programar picos altos en las primeras 2–4 semanas; incrementar progresivamente según regla de +10%/semana y límites de Long Run.',
-    `- Ten en cuenta ${weeks_until_race} semanas hasta la carrera: si quedan pocas semanas, prioriza seguridad y adaptaciones (menos volumen, más calidad y taper).`
-  ].join(' ');
-
-  const typesMsg = 'TIPOS: usa variedad segura: rodajes fáciles, long run, tempo, intervalos/series, fartlek, CA-CO si procede, y semanas de recuperación.';
-
-  const raceDayStrategy = 'DÍA DE CARRERA: en la descripción de la sesión (solo en la semana final) añade una estrategia coherente con el ritmo objetivo: salida ligeramente más lenta, mantener ritmo objetivo en la parte central y acabar fuerte; incluye hidratación y mentalidad.';
-
-  const prevMsg = previousSummary
-    ? `Contexto previo: última semana idx ${previousSummary.lastWeekIndex}, km ${previousSummary.lastWeek_total_km} (long ${previousSummary.lastWeek_longrun_km}). Usa esto para coherencia.`
-    : '';
-
-  const header = [
-    'Eres un entrenador experto en running. Responde SOLO con JSON válido (solo el objeto JSON).',
-    `Genera bloque ${blockLength} semanas: semanas ${blockStart}-${blockEnd} de ${weeks_until_race}.`,
-    `Tipo:${race_type}|Nivel:${level}|Días/sem:${days_per_week}|LongRun día:${preferred_longrun_day || 'no especificado'}`,
-    `Mejor5k:${recent_5k_minutes ?? 'no especificado'}|Objetivo(min):${target_time_minutes ?? 'no especificado'}`
-  ].join(' ');
-
-  const outputSpec = 'Salida: JSON { "plan":[{ "week":n,"workouts":[...] },... ], "summary":"", "descripcion":"", "consejos_generales":"" }.' +
-    ' Cada workout: day (es), weekday_index(1=Lunes..7=Dom), type, distance_km (n), pace_min_km (mm:ss), intensity, description (3–6 frases numeradas), advice. Si hay series incluye segments.';
-
-  const noExtra = 'NO añadas texto fuera del JSON.';
-
+    ? `ATENCIÓN: Este bloque INCLUYE la semana final de la preparación. Incluye la CARRERA en la semana final como el ÚLTIMO entrenamiento de esa semana con la fecha ${race_date}.`
+    : `IMPORTANTE: Este bloque NO debe incluir la carrera ni mencionar la fecha de la carrera. No pongas la carrera en este bloque.`;
+  const prevMsg = previousSummary ? `Contexto previo: última semana index ${previousSummary.lastWeekIndex}, km totales última semana ${previousSummary.lastWeek_total_km} km, long run ${previousSummary.lastWeek_longrun_km} km, tipo más duro: ${previousSummary.lastWeek_hardest_type}. Usa esto para que la progresión sea coherente.` : '';
   return [
-    header,
+    `Eres un entrenador experto en running. Responde SOLO con JSON válido y NADA más.`,
+    `Genera un bloque de ${blockLength} semanas: semanas ${blockStart}-${blockEnd} (de ${weeks_until_race} semanas totales).`,
+    `Tipo de carrera: ${race_type} | Nivel: ${level} | Días/sem: ${days_per_week} | Día long run: ${preferred_longrun_day || 'no especificado'}`,
+    `Mejor 5k: ${recent_5k_minutes ?? 'no especificado'} | Tiempo objetivo (min): ${target_time_minutes ?? 'no especificado'}`,
     fixedDaysMsg,
     raceMsg,
     prevMsg,
-    progressionShort,
-    longRunLimits,
-    beginnerRule,
-    typesMsg,
-    raceDayStrategy,
-    outputSpec,
-    noExtra
+    specificPrompt,
+    `Salida: JSON: { "plan":[{ "week":n,"workouts":[...] }, ...], "summary":"", "descripcion":"", "consejos_generales":"" }`,
+    `Cada workout: day (es), weekday_index (1=Lunes..7=Domingo), type, distance_km (n), pace_min_km (mm:ss), intensity, description (3-6 frases numeradas), advice. Si hay series incluye segments.`,
+    `NO añadas texto fuera del JSON.`
   ].filter(Boolean).join('\n');
 }
-
-
 
 function validateBlock(blockJson, payload, previousSummary) {
   const errors = [];
@@ -522,7 +578,10 @@ app.post('/api/generate-plan', async (req, res) => {
     for (let i = 0; i < blocks.length; i++) {
       const b = blocks[i];
       const includeRace = (b.end === totalWeeks);
-      const prompt = buildBlockPrompt(payload, b.start, b.length, b.end, fixedDaysFromFirstBlock, includeRace, previousSummary);
+      const isFirstBlock = ( i === 0);
+      console.log(isFirstBlock);
+      const prompt = buildBlockPrompt(payload, b.start, b.length, b.end, fixedDaysFromFirstBlock, includeRace, previousSummary, isFirstBlock);
+      console.log(prompt);
       console.log(`[generate-plan] Generando bloque ${b.start}-${b.end} includeRace=${includeRace} (prompt chars ${prompt.length})`);
 
       const openaiRes = await callOpenAI({
@@ -568,7 +627,7 @@ app.post('/api/generate-plan', async (req, res) => {
             console.log('[generate-plan] correction accepted for block', b.start);
             blockResults.push(tryJson);
             const sum = summarizeBlock(tryJson);
-            previousSummary = sum;
+            previousSummary = sum
 
             if (!fixedDaysFromFirstBlock) {
               try {
@@ -781,3 +840,416 @@ process.on('uncaughtException', (err) => {
 app.listen(PORT, () => {
   console.log(`Servidor backend en http://localhost:${PORT}`);
 });
+
+function buildPrompt_5k_principiante(p, opts, isFirstBlock){ 
+  //const header = commonHeader(p, opts);
+
+  if (isFirstBlock) {
+    const rules = [
+      `Reglas de progresión
+      - Comienza con distancias cortas (1–3 km) y combina Correr-Caminar (CA-CO) si es necesario.
+      - Aumenta el kilometraje semanal máximo un 10 % por semana.
+      - El “long run” inicial no debe superar los 2 km.
+      - El “long run” nunca debe superar el 100 % de la distancia de la carrera (máx. 5 km).
+      - Cada 3ª semana reduce el volumen total un 20 % (semana de recuperación).
+      - Incluye variedad: CA-CO, rodajes suaves, pequeños intervalos, y sesiones de movilidad o fuerza ligera.
+      - Mantén las intensidades muy cómodas (ritmo de conversación).
+      - En las últimas 2 semanas (si hay tiempo), reduce el volumen (taper) manteniendo 1 sesión de ritmo controlado.
+      - Prioriza la constancia sobre la velocidad: el objetivo es completar los 5K sin parar y con buena sensación.
+      `
+      ].join(' ');
+  } else {
+    const rules = [
+      `Reglas de progresión
+      - Aumenta el kilometraje semanal máximo un 10 % por semana.
+      - El “long run” nunca debe superar el 100 % de la distancia de la carrera (máx. 5 km).
+      - Cada 3ª semana reduce el volumen total un 20 % (semana de recuperación).
+      - Incluye variedad: CA-CO, rodajes suaves, pequeños intervalos, y sesiones de movilidad o fuerza ligera.
+      - Mantén las intensidades muy cómodas (ritmo de conversación).
+      - En las últimas 2 semanas (si hay tiempo), reduce el volumen (taper) manteniendo 1 sesión de ritmo controlado.
+      - Prioriza la constancia sobre la velocidad: el objetivo es completar los 5K sin parar y con buena sensación.
+      `
+      ].join(' ');
+  }
+  return [ rules,commonRules(p) ].join('\n');
+}
+function buildPrompt_5k_intermedio(p, opts,isFirstBlock){ 
+  //const header = commonHeader(p, opts);
+  let rules;
+  if (isFirstBlock) {
+    rules = [
+    `
+    Reglas de progresión
+    - Comienza con rodajes de base de 3–5 km y un long run de 5–6 km.
+    - Aumenta el kilometraje semanal máximo un 8–10 % por semana.
+    - El “long run” no debe superar los 6 km ni el 120 % de la distancia de carrera.
+    - Cada 3ª o 4ª semana aplica una descarga reduciendo volumen un 15–20 %.
+    - Incluye variedad: rodajes controlados, fartlek, intervalos cortos, y long runs progresivos.
+    - Añade trabajos de ritmo de carrera a partir de la semana 3–4.
+    - En las últimas 2 semanas (taper), reduce volumen y mantén una sesión de ritmo de carrera para afinar sensaciones.
+    - Ajusta intensidades según ritmo objetivo (por ejemplo, ritmo de carrera o ritmo 5K + 15–20 seg/km en rodajes).
+    
+    `
+    ]
+  } else {
+     rules = [
+    `
+    Reglas de progresión
+    - Aumenta el kilometraje semanal máximo un 8–10 % por semana.
+    - El “long run” no debe superar el 120 % de la distancia de carrera.
+    - Cada 3ª o 4ª semana aplica una descarga reduciendo volumen un 15–20 %.
+    - Incluye variedad: rodajes controlados, fartlek, intervalos cortos, y long runs progresivos.
+    - Añade trabajos de ritmo de carrera a partir de la semana 3–4.
+    - En las últimas 2 semanas (taper), reduce volumen y mantén una sesión de ritmo de carrera para afinar sensaciones.
+    - Ajusta intensidades según ritmo objetivo (por ejemplo, ritmo de carrera o ritmo 5K + 15–20 seg/km en rodajes). 
+    `
+    ]
+  }
+ 
+  return [rules,commonRules(p) ].join('\n');
+}
+function buildPrompt_5k_avanzado(p, opts,isFirstBlock){ 
+  //const header = commonHeader(p, opts);
+  let rules;
+  if (isFirstBlock) {
+     rules = [
+      `
+      Reglas de progresión
+      - Comienza con base sólida (rodajes de 5–7 km y un long run de 7–8 km).
+      - Aumenta el kilometraje semanal máximo un 6–8 % por semana.
+      - El “long run” nunca debe superar el 120 % de la distancia de carrera (máx. 6 km).
+      - Cada 4ª semana reduce el volumen total un 15–20 % (semana de recuperación).
+      - Incluye variedad avanzada: intervalos cortos e intensos, fartlek, tempo runs, y long runs con tramos a ritmo de carrera o más rápido.
+      - Mantén equilibrio entre sesiones intensas y recuperación: no más de 2 días duros por semana.
+      - En las últimas 2 semanas, reduce volumen pero mantén intensidad (taper activo).
+      - Ajusta ritmos según objetivo (por ejemplo, ritmo 5K objetivo ± 5 seg/km en entrenamientos específicos).
+      - Focaliza el entrenamiento en mejorar eficiencia y tolerancia al ritmo de carrera.
+      
+      `
+    ].join(' ');
+  } else {
+     rules = [
+      `
+      Reglas de progresión
+      - Aumenta el kilometraje semanal máximo un 6–8 % por semana.
+      - El “long run” nunca debe superar el 120 % de la distancia de carrera (máx. 6 km).
+      - Cada 4ª semana reduce el volumen total un 15–20 % (semana de recuperación).
+      - Incluye variedad avanzada: intervalos cortos e intensos, fartlek, tempo runs, y long runs con tramos a ritmo de carrera o más rápido.
+      - Mantén equilibrio entre sesiones intensas y recuperación: no más de 2 días duros por semana.
+      - En las últimas 2 semanas , reduce volumen pero mantén intensidad (taper activo).
+      - Ajusta ritmos según objetivo (por ejemplo, ritmo 5K objetivo ± 5 seg/km en entrenamientos específicos).
+      - Focaliza el entrenamiento en mejorar eficiencia y tolerancia al ritmo de carrera.
+      `
+    ].join(' ');
+  }
+
+  return [ rules,commonRules(p) ].join('\n');
+}
+
+function buildPrompt_10k_principiante(p, opts,isFirstBlock){ 
+  //const header = commonHeader(p, opts);
+  let rules;
+  if (isFirstBlock) {
+     rules = [
+      `
+      Reglas de progresión
+      - Comienza con distancias cortas (2–4 km).
+      - Aumenta el kilometraje total semanal máximo un 10 % por semana.
+      - El “long run” nunca debe superar el 100% de la distancia de la carrera objetivo (máx. 10 km).
+      - En este nivel, los primeros long runs no deben superar los 3 km.
+      - Cada 3ª semana reduce el volumen total un 20 % (semana de recuperación).
+      - Incluye variedad: CA-CO (correr-caminar), rodajes suaves,intervalos, tirada larga, etc...
+      - En las últimas 2 semanas reduce volumen (taper).
+      - Ajusta intensidades a ritmo muy cómodoon el objetivo final de terminar la carrera (puede hablar mientras corre).
+      `
+    ].join(' ');
+  } else {
+     rules = [
+      `
+      Reglas de progresión
+      - Aumenta el kilometraje total semanal máximo un 10 % por semana.
+      - El “long run” nunca debe superar el 100% de la distancia de la carrera objetivo (máx. 10 km).
+      - Cada 3ª semana reduce el volumen total un 20 % (semana de recuperación).
+      - Incluye variedad: CA-CO (correr-caminar), rodajes suaves,intervalos, tirada larga, etc...
+      - En las últimas 2 semanas reduce volumen (taper).
+      - Ajusta intensidades a ritmo muy cómodo con el objetivo final de terminar la carrera (puede hablar mientras corre).
+      `
+    ].join(' ');
+  }
+
+  return [ rules,commonRules(p) ].join('\n');
+}
+function buildPrompt_10k_intermedio(p, opts, isFirstBlock){
+  //const header = commonHeader(p, opts);
+  let rules;
+  if (isFirstBlock) {
+     rules = [
+      `
+      Reglas de progresión
+  - Comienza con distancias moderadas (5–7 km).
+  - Aumenta el kilometraje total semanal máximo un 10 % por semana.
+  - El “long run” puede llegar hasta el 110 % de la distancia de la carrera (máx. 11 km).
+  - Las primeras semanas el long run no debe superar los 6 km.
+  - Cada 3ª o 4ª semana reduce el volumen total un 15–20 % (semana de recuperación).
+  - Incluye variedad: rodajes suaves, intervalos, fartlek, tempo runs y long runs.
+  - Una o dos sesiones semanales pueden tener intensidad moderada (zona umbral o ritmo de carrera).
+  - En las últimas 2 semanas, aplica un “taper” reduciendo el volumen y manteniendo la intensidad.
+  - Ajusta ritmos según el objetivo de tiempo en 10 km, priorizando consistencia y técnica y una mejora del tiempo.
+    `
+    ].join(' ');
+  } else {
+     rules = [
+      `
+      Reglas de progresión
+    - Aumenta el kilometraje total semanal máximo un 10 % por semana.
+    - El “long run” puede llegar hasta el 110 % de la distancia de la carrera (máx. 11 km).
+    - Cada 3ª o 4ª semana reduce el volumen total un 15–20 % (semana de recuperación).
+    - Incluye variedad: rodajes suaves, intervalos, fartlek, tempo runs y long runs.
+    - Una o dos sesiones semanales pueden tener intensidad moderada (zona umbral o ritmo de carrera).
+    - En las últimas 2 semanas, aplica un “taper” reduciendo el volumen y manteniendo la intensidad.
+    - Ajusta ritmos según el objetivo de tiempo en 10 km, priorizando consistencia y técnica y una mejora del tiempo.
+    `
+    ].join(' ');
+  }
+  return [ rules, commonRules(p) ].join('\n');
+}
+function buildPrompt_10k_avanzado(p, opts,isFirstBlock){
+  //const header = commonHeader(p, opts);
+  let rules;
+  if (isFirstBlock) {
+     rules = [
+      `Reglas de progresión
+      - Comienza con distancias de base sólidas (7–9 km) y buen volumen semanal.
+      - Aumenta el kilometraje total semanal máximo un 8 % por semana.
+      - El “long run” puede alcanzar hasta el 120 % de la distancia de la carrera (máx. 12 km).
+      - En las primeras semanas, el long run no debe superar los 8 km.
+      - Cada 4ª semana realiza una descarga reduciendo el volumen un 15–20 %.
+      - Incluye variedad avanzada: rodajes controlados, intervalos largos, tempo runs, fartlek y long runs progresivos.
+      - Introduce ritmos de competición o ligeramente más rápidos en las semanas centrales.
+      - En el “taper” (últimas 2 semanas), reduce volumen pero mantiene la calidad con sesiones cortas a ritmo de carrera.
+      - Ajusta las intensidades con precisión según ritmo objetivo (por ejemplo, usando ritmo medio por km o % de FC máx) con el bojetivo de realizar la carrera en el menor tiempo posible.
+      `
+        ].join(' ');
+  } else {
+     rules = [
+      `Reglas de progresión
+      - Aumenta el kilometraje total semanal máximo un 8 % por semana.
+      - El “long run” puede alcanzar hasta el 120 % de la distancia de la carrera (máx. 12 km).
+      - Cada 4ª semana realiza una descarga reduciendo el volumen un 15–20 %.
+      - Incluye variedad avanzada: rodajes controlados, intervalos largos, tempo runs, fartlek y long runs progresivos.
+      - Introduce ritmos de competición o ligeramente más rápidos en las semanas centrales.
+      - En el “taper” (últimas 2 semanas), reduce volumen pero mantiene la calidad con sesiones cortas a ritmo de carrera.
+      - Ajusta las intensidades con precisión según ritmo objetivo (por ejemplo, usando ritmo medio por km o % de FC máx) con el bojetivo de realizar la carrera en el menor tiempo posible.
+      `
+        ].join(' ');
+  }
+  return [rules, commonRules(p) ].join('\n');
+}
+
+function buildPrompt_21k_principiante(p, opts,isFirstBlock){
+  //const header = commonHeader(p, opts);
+  let rules;
+  if (isFirstBlock) {
+    rules = [
+      `Reglas de progresión
+      - Comienza con distancias cortas (4–6 km) y aumenta de forma progresiva.
+      - El “long run” inicial no debe superar los 6–8 km.
+      - Aumenta el kilometraje semanal máximo un 10 % por semana.
+      - El “long run” nunca debe superar la distancia de la carrera (21 km).
+      - Incluye variedad: rodajes suaves, sesiones de CA-CO (si es necesario), intervalos cortos, tiradas largas progresivas.
+      - Evita intensidades altas hasta que se consolide la base aeróbica.
+      - En las últimas 3 semanas, inicia el taper reduciendo volumen pero manteniendo 1 sesión a ritmo de carrera.
+      - Ritmos siempre cómodos al inicio; el objetivo es completar la distancia con buena sensación.
+      `
+    ].join(' ');
+  } else {
+    rules = [
+      `Reglas de progresión
+      - Aumenta el kilometraje semanal máximo un 10 % por semana.
+      - El “long run” nunca debe superar la distancia de la carrera (21 km).
+      - Incluye variedad: rodajes suaves, sesiones de CA-CO (si es necesario), intervalos cortos, tiradas largas progresivas.
+      - Evita intensidades altas hasta que se consolide la base aeróbica.
+      - En las últimas 3 semanas, inicia el taper reduciendo volumen pero manteniendo 1 sesión a ritmo de carrera.
+      - Ritmos siempre cómodos al inicio; el objetivo es completar la distancia con buena sensación.
+      `
+    ].join(' ');
+  }
+  console.log(rules);
+  return [rules, commonRules(p) ].join('\n');
+}
+function buildPrompt_21k_intermedio(p, opts,isFirstBlock){
+  let rules;
+  //const header = commonHeader(p, opts);
+  if (isFirstBlock) {
+     rules = [
+      `Reglas de progresión
+      - Comienza con rodajes de 6–8 km y un long run de 10–12 km.
+      - Aumenta el kilometraje semanal máximo un 8–10 % por semana.
+      - El “long run” puede llegar hasta un máximo del 100 % de la distancia (21 km).
+      - Cada 3ª o 4ª semana reduce volumen un 15–20 % (semana de recuperación).
+      - Incluye variedad: rodajes controlados, fartlek, intervalos, tempo runs y long runs progresivos.
+      - Introduce ritmo de carrera en la segunda mitad de los long runs en semanas clave.
+      - En las últimas 2–3 semanas reduce volumen y aumenta la recuperación (taper).
+      - Ajusta intensidades según ritmo objetivo o tiempo previsto (usa ritmo por km o FC).
+      `
+      ].join(' ');
+  } else {
+     rules = [
+      `Reglas de progresión
+      - Aumenta el kilometraje semanal máximo un 8–10 % por semana.
+      - El “long run” puede llegar hasta un máximo del 100 % de la distancia (21 km).
+      - Cada 3ª o 4ª semana reduce volumen un 15–20 % (semana de recuperación).
+      - Incluye variedad: rodajes controlados, fartlek, intervalos, tempo runs y long runs progresivos.
+      - Introduce ritmo de carrera en la segunda mitad de los long runs en semanas clave.
+      - En las últimas 2–3 semanas reduce volumen y aumenta la recuperación (taper).
+      - Ajusta intensidades según ritmo objetivo o tiempo previsto (usa ritmo por km o FC).
+      `
+      ].join(' ');
+  }
+
+  return [rules, commonRules(p) ].join('\n');
+}
+function buildPrompt_21k_avanzado(p, opts,isFirstBlock){
+  let rules;
+  //const header = commonHeader(p, opts);
+  if (isFirstBlock) {
+     rules = [
+      `Reglas de progresión
+      - Comienza con rodajes de base (8–10 km) y un long run de 14–16 km.
+      - Aumenta el kilometraje semanal máximo un 6–8 % por semana.
+      - El “long run” no debe superar la distancia de carrera (máx. 21 km).
+      - Cada 4ª semana aplica una descarga reduciendo el volumen un 15–20 %.
+      - Incluye variedad avanzada: tempo runs largos, intervalos, fartlek, rodajes con cambios de ritmo y long runs con tramos a ritmo de carrera.
+      - Las semanas centrales deben simular el esfuerzo real, combinando ritmo de carrera con trabajo de resistencia.
+      - En las últimas 3 semanas (taper), reduce volumen manteniendo calidad con sesiones cortas a ritmo de competición.
+      - Planifica las long runs clave con estrategias de nutrición, hidratación y control de ritmo.
+      `
+    ].join(' ');
+  } else {
+     rules = [
+      `Reglas de progresión
+      - Aumenta el kilometraje semanal máximo un 6–8 % por semana.
+      - El “long run” no debe superar la distancia de carrera (máx. 21 km).
+      - Cada 4ª semana aplica una descarga reduciendo el volumen un 15–20 %.
+      - Incluye variedad avanzada: tempo runs largos, intervalos, fartlek, rodajes con cambios de ritmo y long runs con tramos a ritmo de carrera.
+      - Las semanas centrales deben simular el esfuerzo real, combinando ritmo de carrera con trabajo de resistencia.
+      - En las últimas 3 semanas (taper), reduce volumen manteniendo calidad con sesiones cortas a ritmo de competición.
+      - Planifica las long runs clave con estrategias de nutrición, hidratación y control de ritmo.
+      `
+    ].join(' ');
+  }
+
+  return [ rules, commonRules(p) ].join('\n');
+}
+
+function buildPrompt_42k_principiante(p, opts,isFirstBlock){
+  let rules;
+  //const header = commonHeader(p, opts);
+  if (isFirstBlock) {
+     rules = [
+      `Reglas de progresión
+      - Comienza con distancias suaves (5–7 km) y un long run de 8–10 km.
+      - Aumenta el kilometraje semanal máximo un 10 % por semana.
+      - El “long run” nunca debe superar la distancia de la carrera (42 km).
+      - Los primeros long runs no deben pasar de 10–12 km.
+      - Cada 3ª semana realiza una descarga reduciendo el volumen total un 20 %.
+      - Incluye variedad: rodajes suaves, CA-CO si es necesario, rodajes medios y tiradas largas progresivas.
+      - Introduce trabajos de ritmo solo tras 6–8 semanas de base sólida.
+      - En las últimas 4 semanas, reduce el volumen gradualmente (taper).
+      - El objetivo principal es desarrollar resistencia y consistencia, no velocidad.
+      `
+    ].join(' ');
+  } else {
+     rules = [
+      `Reglas de progresión
+      - Aumenta el kilometraje semanal máximo un 10 % por semana.
+      - El “long run” nunca debe superar la distancia de la carrera (42 km).
+      - Cada 3ª semana realiza una descarga reduciendo el volumen total un 20 %.
+      - Incluye variedad: rodajes suaves, CA-CO si es necesario, rodajes medios y tiradas largas progresivas.
+      - Introduce trabajos de ritmo solo tras 6–8 semanas de base sólida.
+      - En las últimas 4 semanas, reduce el volumen gradualmente (taper).
+      - El objetivo principal es desarrollar resistencia y consistencia, no velocidad.
+      `
+    ].join(' ');
+  }
+
+  return [rules, commonRules(p) ].join('\n');
+}
+function buildPrompt_42k_intermedio(p, opts,isFirstBlock){
+  //const header = commonHeader(p, opts);
+  let rules;
+  if (isFirstBlock) {
+     rules = [
+      `Reglas de progresión
+      - Comienza con rodajes de 8–10 km y un long run de 14–16 km.
+      - Aumenta el kilometraje semanal máximo un 8 % por semana.
+      - El “long run” nunca debe superar la distancia de la carrera (máx. 42 km).
+      - Cada 3ª o 4ª semana aplica una descarga reduciendo volumen un 15–20 %.
+      - Incluye variedad: rodajes controlados, intervalos, tempo runs, fartlek, y long runs con tramos a ritmo de carrera.
+      - Alterna semanas de carga alta con semanas de descarga para evitar sobreentrenamiento.
+      - En las 4 últimas semanas, reduce progresivamente el volumen (taper) y prioriza recuperación y ritmo de carrera.
+      - Ajusta ritmos según el tiempo objetivo o % del ritmo umbral.
+      - Simula condiciones de carrera en 1–2 long runs previos (alimentación, ritmo, terreno).
+      `
+    ].join(' ');
+  } else {
+     rules = [
+      `Reglas de progresión
+      - Aumenta el kilometraje semanal máximo un 8 % por semana.
+      - El “long run” nunca debe superar la distancia de la carrera (máx. 42 km).
+      - Cada 3ª o 4ª semana aplica una descarga reduciendo volumen un 15–20 %.
+      - Incluye variedad: rodajes controlados, intervalos, tempo runs, fartlek, y long runs con tramos a ritmo de carrera.
+      - Alterna semanas de carga alta con semanas de descarga para evitar sobreentrenamiento.
+      - En las 4 últimas semanas, reduce progresivamente el volumen (taper) y prioriza recuperación y ritmo de carrera.
+      - Ajusta ritmos según el tiempo objetivo o % del ritmo umbral.
+      - Simula condiciones de carrera en 1–2 long runs previos (alimentación, ritmo, terreno).
+      `
+    ].join(' ');
+  }
+
+  return [ rules, commonRules(p) ].join('\n');
+}
+function buildPrompt_42k_avanzado(p, opts, isFirstBlock){
+  //const header = commonHeader(p, opts);
+  let rules;
+  if (isFirstBlock) {
+     rules = [
+      `Reglas de progresión
+      - Comienza con rodajes de 8–10 km y un long run de 14–16 km.
+      - Aumenta el kilometraje semanal máximo un 8 % por semana.
+      - El “long run” nunca debe superar la distancia de la carrera (máx. 42 km).
+      - Cada 3ª o 4ª semana aplica una descarga reduciendo volumen un 15–20 %.
+      - Incluye variedad: rodajes controlados, intervalos, tempo runs, fartlek, y long runs con tramos a ritmo de carrera.
+      - Alterna semanas de carga alta con semanas de descarga para evitar sobreentrenamiento.
+      - En las 4 últimas semanas, reduce progresivamente el volumen (taper) y prioriza recuperación y ritmo de carrera.
+      - Ajusta ritmos según el tiempo objetivo o % del ritmo umbral.
+      - Simula condiciones de carrera en 1–2 long runs previos (alimentación, ritmo, terreno).
+      `  ].join(' ');
+  } else {
+   rules = [
+      `Reglas de progresión
+      - Aumenta el kilometraje semanal máximo un 8 % por semana.
+      - El “long run” nunca debe superar la distancia de la carrera (máx. 42 km).
+      - Cada 3ª o 4ª semana aplica una descarga reduciendo volumen un 15–20 %.
+      - Incluye variedad: rodajes controlados, intervalos, tempo runs, fartlek, y long runs con tramos a ritmo de carrera.
+      - Alterna semanas de carga alta con semanas de descarga para evitar sobreentrenamiento.
+      - En las 4 últimas semanas, reduce progresivamente el volumen (taper) y prioriza recuperación y ritmo de carrera.
+      - Ajusta ritmos según el tiempo objetivo o % del ritmo umbral.
+      - Simula condiciones de carrera en 1–2 long runs previos (alimentación, ritmo, terreno).
+      `  ].join(' ');
+  }
+
+  return [ rules, commonRules(p) ].join('\n');
+}
+
+function commonRules(payload) {
+  return [
+    'El “Long Run” es OBLIGATORIO una vez por semana, siempre el día designado.',
+    'Cada semana debe incluir entrenamientos VARIADOS. En cada bloque de 2 semanas, deben aparecer al menos tres tipos distintos entre: rodaje suave, intervalos, tempo run, fartlek, CA-CO (si nivel principiante), recuperación activa.',
+    'Cada semana debe incluir entrenamientos VARIADOS. En cada bloque de 2 semanas, deben aparecer al menos tres tipos distintos entre: rodaje suave, intervalos, tempo run, fartlek, CA-CO (si nivel principiante), recuperación activa.',
+
+    'Salida: SOLO JSON válido EXACTO: {"plan":[{"week":n,"workouts":[...]}],"summary":"","descripcion":"","consejos_generales":""}.',
+    'Cada semana: exactamente days_per_week workouts; no mover días dentro del bloque.',
+    'Formato workout: day (es), weekday_index(1-7), type, distance_km (n), pace_min_km ("mm:ss"), intensity, description (3-6 frases numeradas), advice. Si series->segments.',
+  ].join(' ');
+}
